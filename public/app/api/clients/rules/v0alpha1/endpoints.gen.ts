@@ -869,11 +869,11 @@ export type AlertRuleSpec = {
   notificationSettings?: {
     activeTimeIntervals?: string[];
     groupBy?: string[];
-    groupInterval?: string;
-    groupWait?: string;
+    groupInterval?: any & any;
+    groupWait?: any & any;
     muteTimeIntervals?: string[];
     receiver: string;
-    repeatInterval?: string;
+    repeatInterval?: any & any;
   };
   panelRef?: {
     dashboardUID: string;
