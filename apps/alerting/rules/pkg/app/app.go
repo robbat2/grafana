@@ -19,7 +19,7 @@ func New(cfg app.Config) (app.App, error) {
 	}
 
 	c := simple.AppConfig{
-		Name:       "alerting.notification",
+		Name:       "alerting.rules",
 		KubeConfig: cfg.KubeConfig,
 		InformerConfig: simple.AppInformerConfig{
 			ErrorHandler: func(ctx context.Context, err error) {
