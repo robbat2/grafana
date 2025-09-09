@@ -8,6 +8,7 @@ import { Count, varPreLine } from 'uwrap';
 import {
   FieldType,
   Field,
+  FieldConfigSource,
   formattedValueToString,
   GrafanaTheme2,
   DisplayValue,
@@ -28,16 +29,9 @@ import { getTextColorForAlphaBackground } from '../../utils/colors';
 import { TableCellOptions } from '../Table/types';
 
 import { inferPills } from './Cells/PillCell';
+import { AutoCellRenderer, getCellRenderer } from './Cells/renderers';
 import { COLUMN, TABLE } from './constants';
-import {
-  TableRow,
-  ColumnTypes,
-  FrameToRowsConverter,
-  Comparator,
-  TypographyCtx,
-  MeasureCellHeight,
-  MeasureCellHeightEntry,
-} from './types';
+import { TableRow, ColumnTypes, Comparator, TypographyCtx, MeasureCellHeight, MeasureCellHeightEntry } from './types';
 
 /* ---------------------------- Cell calculations --------------------------- */
 export type CellNumLinesCalculator = (text: string, cellWidth: number) => number;
@@ -80,12 +74,17 @@ export function isCellInspectEnabled(field: Field): boolean {
  * Returns true if text wrapping should be applied to the cell.
  */
 export function shouldTextWrap(field: Field): boolean {
-  const cellOptions = getCellOptions(field);
-  // @ts-ignore - a handful of cellTypes have boolean wrapText, but not all of them.
-  // we should be very careful to only use boolean type for cellOptions.wrapText.
-  // TBH we will probably move this up to a field option which is showIf rendered anyway,
-  // but that'll be a migration to do, so it needs to happen post-GA.
-  return Boolean(cellOptions?.wrapText);
+  return Boolean(field.config.custom?.wrapText);
+}
+
+/**
+ * @internal wrap a cell height measurer to clamp its output to the maxHeight defined in the field, if any.
+ */
+function clampByMaxHeight(measurer: MeasureCellHeight, maxHeight = Infinity): MeasureCellHeight {
+  return (value, width, field, rowIdx, lineHeight) => {
+    const rawHeight = measurer(value, width, field, rowIdx, lineHeight);
+    return Math.min(rawHeight, maxHeight);
+  };
 }
 
 /**
@@ -253,7 +252,8 @@ const spaceRegex = /[\s-]/;
  */
 export function buildCellHeightMeasurers(
   fields: Field[],
-  typographyCtx: TypographyCtx
+  typographyCtx: TypographyCtx,
+  maxHeight?: number
 ): MeasureCellHeightEntry[] | undefined {
   const result: Record<string, MeasureCellHeightEntry> = {};
   let wrappedFields = 0;
@@ -283,8 +283,8 @@ export function buildCellHeightMeasurers(
     if (!result[measurerFactoryKey]) {
       const [measure, estimate] = measurerFactory[measurerFactoryKey]();
       result[measurerFactoryKey] = {
-        measure,
-        estimate,
+        measure: clampByMaxHeight(measure, maxHeight),
+        estimate: estimate != null ? clampByMaxHeight(estimate, maxHeight) : undefined,
         fieldIdxs: [],
       };
     }
@@ -301,8 +301,14 @@ export function buildCellHeightMeasurers(
         setupMeasurerForIdx(TableCellDisplayMode.DataLinks, fieldIdx);
       } else if (cellType === TableCellDisplayMode.Pill) {
         setupMeasurerForIdx(TableCellDisplayMode.Pill, fieldIdx);
-      } else if (field.type === FieldType.string) {
+      } else if (
+        field.type === FieldType.string &&
+        getCellRenderer(field, getCellOptions(field)) === AutoCellRenderer
+      ) {
         setupMeasurerForIdx(TableCellDisplayMode.Auto, fieldIdx);
+      } else {
+        // no measurer was configured for this cell type
+        wrappedFields--;
       }
     }
   }
@@ -679,7 +685,7 @@ export const frameToRecords = (frame: DataFrame): TableRow[] => {
 
   // Creates a function that converts a DataFrame into an array of TableRows
   // Uses new Function() for performance as it's faster than creating rows using loops
-  const convert = new Function('frame', fnBody) as unknown as FrameToRowsConverter;
+  const convert = new Function('frame', fnBody);
   return convert(frame);
 };
 
@@ -830,6 +836,58 @@ export const processNestedTableRows = (
 
 /**
  * @internal
+ * Get the maximum number of reducers across all fields
+ */
+const getMaxReducerCount = (dataFrame: DataFrame, fieldConfig?: FieldConfigSource): number => {
+  // Filter to only numeric fields that can have reducers
+  const numericFields = dataFrame.fields.filter(({ type }) => type === FieldType.number);
+
+  // If there are no numeric fields, return 0
+  if (numericFields.length === 0) {
+    return 0;
+  }
+
+  // Map each field to its reducer count (direct config or override)
+  const reducerCounts = numericFields.map((field) => {
+    // Get the direct reducer count from the field config
+    const directReducers = field.config?.custom?.footer?.reducers ?? [];
+    let reducerCount = directReducers.length;
+
+    // Check for overrides if field config is available
+    if (fieldConfig?.overrides) {
+      // Find override that matches this field
+      const override = fieldConfig.overrides.find(
+        ({ matcher: { id, options } }) => id === 'byName' && options === getDisplayName(field)
+      );
+
+      // Check if there's a footer reducer property in the override
+      const footerProperty = override?.properties?.find(({ id }) => id === 'custom.footer.reducers');
+      if (footerProperty?.value && Array.isArray(footerProperty.value)) {
+        // If override exists, it takes precedence over direct config
+        reducerCount = footerProperty.value.length;
+      }
+    }
+
+    return reducerCount;
+  });
+
+  // Return the maximum count or 0 if no reducers found
+  return reducerCounts.length > 0 ? Math.max(...reducerCounts) : 0;
+};
+
+/**
+ * @internal
+ * Calculate the footer height based on the maximum reducer count
+ */
+export const calculateFooterHeight = (dataFrame: DataFrame, fieldConfig?: FieldConfigSource) => {
+  const maxReducerCount = getMaxReducerCount(dataFrame, fieldConfig);
+  // Base height (+ padding) + height per reducer
+  return maxReducerCount * TABLE.LINE_HEIGHT + TABLE.CELL_PADDING * 2;
+};
+
+/**
+ * @internal
+ * returns the display name of a field
  * returns the display name of a field.
  * We intentionally do not want to use @grafana/data's getFieldDisplayName here,
  * instead we have a call to cacheFieldDisplayNames up in TablePanel to handle this
@@ -849,7 +907,7 @@ export const predicateByName = (name: string) => (f: Field) => f.name === name |
  * returns only fields that are not nested tables and not explicitly hidden
  */
 export function getVisibleFields(fields: Field[]): Field[] {
-  return fields.filter((field) => field.type !== FieldType.nestedFrames && field.config.custom?.hidden !== true);
+  return fields.filter((field) => field.type !== FieldType.nestedFrames && field.config.custom?.hideFrom?.viz !== true);
 }
 
 /**
@@ -965,3 +1023,19 @@ export const displayJsonValue: DisplayProcessor = (value: unknown): DisplayValue
 
   return { text: displayValue, numeric: Number.NaN };
 };
+
+export function getSummaryCellTextAlign(textAlign: TextAlign, cellType: TableCellDisplayMode): TextAlign {
+  // gauge is weird. left-aligned gauge has the viz on the left and its numbers on the right, and vice-versa.
+  // if you center-aligned your gauge... ok.
+  if (cellType === TableCellDisplayMode.Gauge) {
+    return (
+      {
+        left: 'right',
+        right: 'left',
+        center: 'center',
+      } as const
+    )[textAlign];
+  }
+
+  return textAlign;
+}

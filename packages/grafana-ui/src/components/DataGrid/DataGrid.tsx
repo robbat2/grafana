@@ -2,8 +2,8 @@ import 'react-data-grid/lib/styles.css';
 
 import { css } from '@emotion/css';
 import clsx from 'clsx';
-import { ComponentProps, ReactNode, useState } from 'react';
-import { DataGrid as RDG } from 'react-data-grid';
+import { ComponentProps, ReactNode, RefObject, useState } from 'react';
+import { DataGridHandle, DataGrid as RDG } from 'react-data-grid';
 
 import { colorManipulator, GrafanaTheme2 } from '@grafana/data';
 import { Trans } from '@grafana/i18n';
@@ -25,6 +25,8 @@ export interface DataGridProps<R, SR> extends ComponentProps<typeof RDG<R, SR>> 
   transparent?: boolean;
   pagination?: DataGridPaginationProps;
   hideHeader?: boolean;
+  // NOTE: until React 19, we must use a prop with a name other than "ref" for this.
+  gridRef?: RefObject<DataGridHandle>;
 }
 
 const PaginatedDataGrid = ({
@@ -71,6 +73,7 @@ export function DataGrid<R, SR>({
   hideHeader,
   className,
   headerRowClass,
+  gridRef,
   ...props
 }: DataGridProps<R, SR>) {
   const styles = useStyles2(getStyles, Boolean(pagination), transparent, hideHeader);
@@ -79,6 +82,7 @@ export function DataGrid<R, SR>({
     <RDG<R, SR>
       className={clsx(styles.container, className)}
       headerRowClass={clsx(styles.header, headerRowClass)}
+      ref={gridRef}
       {...props}
     />
   );

@@ -12,7 +12,7 @@ import { ButtonSelect } from '../../Dropdown/ButtonSelect';
 import { FilterInput } from '../../FilterInput/FilterInput';
 import { Label } from '../../Forms/Label';
 import { Stack } from '../../Layout/Stack/Stack';
-import { FilterType } from '../types';
+import { FilterType, TableRow } from '../types';
 import { getDisplayName } from '../utils';
 
 import { FilterList } from './FilterList';
@@ -36,9 +36,9 @@ const OPERATORS = Object.values(operatorSelectableValues);
 
 interface Props {
   name: string;
-  rows: any[];
-  filterValue: any;
-  setFilter: (value: any) => void;
+  rows: TableRow[];
+  filterValue?: Array<SelectableValue<unknown>>;
+  setFilter: React.Dispatch<React.SetStateAction<FilterType>>;
   onClose: () => void;
   field?: Field;
   searchFilter: string;
@@ -102,6 +102,7 @@ export const FilterPopup = ({
     [setFilter, onClose] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
+  const filterInputPlaceholder = t('grafana-ui.table.filter-popup-input-placeholder', 'Filter values');
   const clearFilterVisible = useMemo(() => filterValue !== undefined, [filterValue]);
   const styles = useStyles2(getStyles);
 
@@ -130,7 +131,8 @@ export const FilterPopup = ({
 
           <Stack gap={1}>
             <FilterInput
-              placeholder={t('grafana-ui.table.filter-popup-input-placeholder', 'Filter values')}
+              placeholder={filterInputPlaceholder}
+              title={filterInputPlaceholder}
               onChange={setSearchFilter}
               value={searchFilter}
             />

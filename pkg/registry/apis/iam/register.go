@@ -104,9 +104,13 @@ func (b *IdentityAccessManagementAPIBuilder) GetGroupVersion() schema.GroupVersi
 
 func (b *IdentityAccessManagementAPIBuilder) InstallSchema(scheme *runtime.Scheme) error {
 	if b.enableAuthZApis {
-		if err := iamv0.AddToScheme(scheme); err != nil {
+		if err := iamv0.AddAuthZKnownTypes(scheme); err != nil {
 			return err
 		}
+	}
+
+	if err := iamv0.AddAuthNKnownTypes(scheme); err != nil {
+		return err
 	}
 
 	legacyiamv0.AddKnownTypes(scheme, legacyiamv0.VERSION)
@@ -116,8 +120,8 @@ func (b *IdentityAccessManagementAPIBuilder) InstallSchema(scheme *runtime.Schem
 	// "no kind is registered for the type"
 	legacyiamv0.AddKnownTypes(scheme, runtime.APIVersionInternal)
 
-	metav1.AddToGroupVersion(scheme, legacyiamv0.SchemeGroupVersion)
-	return scheme.SetVersionPriority(legacyiamv0.SchemeGroupVersion)
+	metav1.AddToGroupVersion(scheme, iamv0.SchemeGroupVersion)
+	return scheme.SetVersionPriority(iamv0.SchemeGroupVersion)
 }
 
 func (b *IdentityAccessManagementAPIBuilder) AllowedV0Alpha1Resources() []string {
@@ -127,14 +131,15 @@ func (b *IdentityAccessManagementAPIBuilder) AllowedV0Alpha1Resources() []string
 func (b *IdentityAccessManagementAPIBuilder) UpdateAPIGroupInfo(apiGroupInfo *genericapiserver.APIGroupInfo, opts builder.APIGroupOptions) error {
 	storage := map[string]rest.Storage{}
 
-	teamResource := legacyiamv0.TeamResourceInfo
+	teamResource := iamv0.TeamResourceInfo
 	storage[teamResource.StoragePath()] = team.NewLegacyStore(b.store, b.legacyAccessClient)
 	storage[teamResource.StoragePath("members")] = team.NewLegacyTeamMemberREST(b.store)
 
-	teamBindingResource := legacyiamv0.TeamBindingResourceInfo
+	teamBindingResource := iamv0.TeamBindingResourceInfo
 	storage[teamBindingResource.StoragePath()] = team.NewLegacyBindingStore(b.store)
 
-	userResource := legacyiamv0.UserResourceInfo
+	// User store registration
+	userResource := iamv0.UserResourceInfo
 	legacyStore := user.NewLegacyStore(b.store, b.legacyAccessClient, b.enableAuthnMutation)
 	storage[userResource.StoragePath()] = legacyStore
 
@@ -153,8 +158,26 @@ func (b *IdentityAccessManagementAPIBuilder) UpdateAPIGroupInfo(apiGroupInfo *ge
 	}
 
 	storage[userResource.StoragePath("teams")] = user.NewLegacyTeamMemberREST(b.store)
-	serviceAccountResource := legacyiamv0.ServiceAccountResourceInfo
-	storage[serviceAccountResource.StoragePath()] = serviceaccount.NewLegacyStore(b.store, b.legacyAccessClient)
+
+	// Service Accounts store registration
+	serviceAccountResource := iamv0.ServiceAccountResourceInfo
+	saLegacyStore := serviceaccount.NewLegacyStore(b.store, b.legacyAccessClient, b.enableAuthnMutation)
+	storage[serviceAccountResource.StoragePath()] = saLegacyStore
+
+	if b.enableDualWriter {
+		store, err := grafanaregistry.NewRegistryStore(opts.Scheme, serviceAccountResource, opts.OptsGetter)
+		if err != nil {
+			return err
+		}
+
+		dw, err := opts.DualWriteBuilder(serviceAccountResource.GroupResource(), saLegacyStore, store)
+		if err != nil {
+			return err
+		}
+
+		storage[serviceAccountResource.StoragePath()] = dw
+	}
+
 	storage[serviceAccountResource.StoragePath("tokens")] = serviceaccount.NewLegacyTokenREST(b.store)
 
 	if b.sso != nil {
@@ -265,15 +288,21 @@ func (b *IdentityAccessManagementAPIBuilder) GetAuthorizer() authorizer.Authoriz
 func (b *IdentityAccessManagementAPIBuilder) Validate(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) (err error) {
 	switch a.GetOperation() {
 	case admission.Create:
-		if a.GetKind() == legacyiamv0.UserResourceInfo.GroupVersionKind() {
+		switch typedObj := a.GetObject().(type) {
+		case *iamv0.User:
 			return b.validateCreateUser(ctx, a, o)
+		case *iamv0.ServiceAccount:
+			return serviceaccount.ValidateOnCreate(ctx, typedObj)
 		}
 		return nil
-	case admission.Connect:
-	case admission.Delete:
 	case admission.Update:
 		return nil
+	case admission.Delete:
+		return nil
+	case admission.Connect:
+		return nil
 	}
+
 	return nil
 }
 
@@ -285,12 +314,12 @@ func (b *IdentityAccessManagementAPIBuilder) validateCreateUser(ctx context.Cont
 
 	requester, err := identity.GetRequester(ctx)
 	if err != nil {
-		return apierrors.NewBadRequest("no identity found")
+		return apierrors.NewUnauthorized("no identity found")
 	}
 
 	// Temporary validation that the user is not trying to create a Grafana Admin without being a Grafana Admin.
 	if userObj.Spec.GrafanaAdmin && !requester.GetIsGrafanaAdmin() {
-		return apierrors.NewForbidden(legacyiamv0.UserResourceInfo.GroupResource(),
+		return apierrors.NewForbidden(iamv0.UserResourceInfo.GroupResource(),
 			userObj.Name,
 			fmt.Errorf("only grafana admins can create grafana admins"))
 	}
@@ -308,8 +337,11 @@ func (b *IdentityAccessManagementAPIBuilder) validateCreateUser(ctx context.Cont
 func (b *IdentityAccessManagementAPIBuilder) Mutate(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) (err error) {
 	switch a.GetOperation() {
 	case admission.Create:
-		if a.GetKind() == legacyiamv0.UserResourceInfo.GroupVersionKind() {
-			return b.mutateUser(ctx, a, o)
+		switch typedObj := a.GetObject().(type) {
+		case *iamv0.User:
+			return user.MutateOnCreate(ctx, typedObj)
+		case *iamv0.ServiceAccount:
+			return serviceaccount.MutateOnCreate(ctx, typedObj)
 		}
 		return nil
 	case admission.Update:
@@ -318,25 +350,6 @@ func (b *IdentityAccessManagementAPIBuilder) Mutate(ctx context.Context, a admis
 		return nil
 	case admission.Connect:
 		return nil
-	}
-
-	return nil
-}
-
-func (b *IdentityAccessManagementAPIBuilder) mutateUser(_ context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
-	userObj, ok := a.GetObject().(*iamv0.User)
-	if !ok {
-		return nil
-	}
-
-	userObj.Spec.Email = strings.ToLower(userObj.Spec.Email)
-	userObj.Spec.Login = strings.ToLower(userObj.Spec.Login)
-
-	if userObj.Spec.Login == "" {
-		userObj.Spec.Login = userObj.Spec.Email
-	}
-	if userObj.Spec.Email == "" {
-		userObj.Spec.Email = userObj.Spec.Login
 	}
 
 	return nil
